@@ -3,7 +3,7 @@
 //|  Strict M1 score-based GOLD scalper with fixed risk SL.           |
 //+------------------------------------------------------------------+
 #property copyright "2026 AndroindDeve + AI"
-#property version   "10.2"
+#property version   "10.4"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -12,42 +12,43 @@ CTrade trade;
 //=== Inputs ==========================================================
 
 input group "Version"
-input string  EA_Version                 = "v10.2";
+input string  EA_Version                 = "v10.4";
 
 input group "Profit and risk"
 input double  BaseLot                    = 0.01;
-input double  MaxLotPerSignal            = 0.10;
+input double  MaxLotPerSignal            = 0.04;
 input double  ProfitTargetMoney          = 1.5;    // Close each position at this profit
 input double  RiskStopPctPerPosition     = 9.0;    // Initial SL and emergency close, % of balance per position
 input bool    UseMoneyRiskSL             = true;   // Calculate SL from RiskStopPctPerPosition
 input double  FallbackSL_Pips            = 35.0;   // Fallback if broker tick data is unavailable
 
 input group "Signal sizing"
-input int     WeakSignal_Positions       = 1;      // score 5-6
-input int     MediumSignal_Positions     = 3;      // score 7-8
-input int     StrongSignal_Positions     = 6;      // score 9+
-input int     MinEntryScore              = 5;
+input int     WeakSignal_Positions       = 1;      // score 8-9
+input int     MediumSignal_Positions     = 2;      // score 10
+input int     StrongSignal_Positions     = 3;      // score 11+
+input int     MinEntryScore              = 8;
 
 input group "Smart pullback add"
 input bool    UsePullbackAdds            = true;
-input int     MaxPullbackAddsPerSide     = 3;
+input int     MaxPullbackAddsPerSide     = 1;
 input double  PullbackDrawdownPct        = 0.5;    // Side drawdown, % balance, before add can happen
 input double  PullbackMinPips            = 3.0;    // Price must move against side average by this much
 input double  PullbackZonePips           = 2.0;    // Near EMA/BB/current candle low-high
 input double  PullbackAtrPart            = 0.25;
 input double  PullbackLotMult            = 1.2;
-input int     PullbackMinScore           = 6;
-input int     MinSecondsBetweenAdds      = 45;
+input int     PullbackMinScore           = 8;
+input int     MinSecondsBetweenAdds      = 120;
 
 input group "Execution filters"
-input int     MaxTotalPositions          = 20;
-input int     MaxPositionsPerSide        = 10;
-input int     MinSecondsBetweenEntries   = 45;
+input int     MaxTotalPositions          = 6;
+input int     MaxPositionsPerSide        = 4;
+input int     MinSecondsBetweenEntries   = 90;
 input bool    ManageLegacyMagic          = true;   // Also manage positions opened by previous EA versions
 input bool    OneEntryPerM1Bar           = true;
 input bool    SignalOnlyOnNewM1Bar       = true;
-input bool    CloseOppositeOnStrongSignal = true;
-input int     OppositeCloseMinScore      = 8;
+input bool    CloseOppositeOnStrongSignal = false;
+input int     OppositeCloseMinScore      = 11;
+input bool    BlockNewEntryWhenInMarket  = true;
 input bool    RequireDIDirection         = true;
 input bool    AvoidChasingExtremes       = true;
 input double  ExtremeBuffer_Pips         = 1.5;
@@ -183,6 +184,13 @@ void OnTick()
       last_signal_bar_time = bar_time;
    }
 
+   if(CountOurPositions() > 0)
+   {
+      if(DebugMode)
+         Print("SKIP new signal: managed position already open; waiting for profit/risk/pullback management");
+      return;
+   }
+
    if(CountOurPositions() >= MaxTotalPositions)
    {
       if(DebugMode)
@@ -257,6 +265,9 @@ SignalData BuildSignal(double ask, double bid)
       direction = -1;
    else
       return EmptySignal("too close to EMA20 dist=" + DoubleToString(dist_pips, 1));
+
+   if(CountOurPositions() > 0)
+      return EmptySignal("open position exists; waiting for profit/risk/pullback management");
 
    if(CountPositionsByDirection(direction) >= MaxPositionsPerSide)
       return EmptySignal("side position limit reached");
@@ -339,8 +350,8 @@ int ScoreDirection(int direction,
       else if(rsi[1] >= 40.0 && rsi[1] < 50.0) score += 1;
       else if(rsi[1] >= 70.0) score -= 2;
 
-      if(stoch_k[1] < 80.0 && stoch_k[1] > stoch_d[1]) score += 2;
-      else if(stoch_k[1] < 80.0) score += 1;
+      if(stoch_k[1] < 80.0 && stoch_k[1] > stoch_d[1]) score += 1;
+      else if(stoch_k[1] < 80.0) score += 0;
       else score -= 1;
 
       double close_m1 = iClose(_Symbol, PERIOD_M1, 1);
@@ -366,8 +377,8 @@ int ScoreDirection(int direction,
       else if(rsi[1] > 50.0 && rsi[1] <= 60.0) score += 1;
       else if(rsi[1] <= 30.0) score -= 2;
 
-      if(stoch_k[1] > 20.0 && stoch_k[1] < stoch_d[1]) score += 2;
-      else if(stoch_k[1] > 20.0) score += 1;
+      if(stoch_k[1] > 20.0 && stoch_k[1] < stoch_d[1]) score += 1;
+      else if(stoch_k[1] > 20.0) score += 0;
       else score -= 1;
 
       double close_m1 = iClose(_Symbol, PERIOD_M1, 1);
@@ -518,6 +529,11 @@ void TryPullbackAdd(int direction, double ask, double bid, double threshold)
 
    if(!IsM1DirectionStillValid(direction))
       return;
+
+   int pullback_score = PullbackSignalScore(direction);
+   if(pullback_score < PullbackMinScore)
+      return;
+
    if(!IsPullbackZone(direction, ask, bid))
       return;
 
@@ -550,6 +566,7 @@ void TryPullbackAdd(int direction, double ask, double bid, double threshold)
       Print("PULLBACK_ADD ", DirStr(direction),
             " level=", levels + 1,
             " lot=", DoubleToString(lot, 2),
+            " score=", pullback_score,
             " sidePnL=", DoubleToString(side_profit, 2),
             " adverse=", DoubleToString(adverse_pips, 1),
             " SL=", DoubleToString(sl, _Digits));
@@ -602,6 +619,35 @@ bool IsM1DirectionStillValid(int direction)
    if(macd_hist > 0.0 && rsi[1] > 50.0) return false;
    if(stoch_k[1] > stoch_d[1] && rsi[1] > 52.0) return false;
    return true;
+}
+
+//+------------------------------------------------------------------+
+int PullbackSignalScore(int direction)
+{
+   double ema[], adx_main[], adx_plus[], adx_minus[];
+   double rsi[], macd_main[], macd_signal[], stoch_k[], stoch_d[];
+   double bb_up[], bb_mid[], bb_low[];
+   int ema_count = MathMax(EMA_Slope_Bars + 2, 5);
+
+   if(!SafeCopy(h_ema,   0, ema,         ema_count)) return -99;
+   if(!SafeCopy(h_adx,   0, adx_main,    4))         return -99;
+   if(!SafeCopy(h_adx,   1, adx_plus,    4))         return -99;
+   if(!SafeCopy(h_adx,   2, adx_minus,   4))         return -99;
+   if(!SafeCopy(h_rsi,   0, rsi,         4))         return -99;
+   if(!SafeCopy(h_macd,  0, macd_main,   4))         return -99;
+   if(!SafeCopy(h_macd,  1, macd_signal, 4))         return -99;
+   if(!SafeCopy(h_stoch, 0, stoch_k,     4))         return -99;
+   if(!SafeCopy(h_stoch, 1, stoch_d,     4))         return -99;
+   if(!SafeCopy(h_bb,    0, bb_up,       4))         return -99;
+   if(!SafeCopy(h_bb,    1, bb_mid,      4))         return -99;
+   if(!SafeCopy(h_bb,    2, bb_low,      4))         return -99;
+
+   if(adx_main[1] < ADX_Min)
+      return -99;
+
+   return ScoreDirection(direction, ema, adx_main, adx_plus, adx_minus,
+                         rsi, macd_main, macd_signal, stoch_k, stoch_d,
+                         bb_up, bb_mid, bb_low);
 }
 
 //+------------------------------------------------------------------+
