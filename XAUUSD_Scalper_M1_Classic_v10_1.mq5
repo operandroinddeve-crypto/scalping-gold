@@ -3,7 +3,7 @@
 //|  Strict M1 score-based GOLD scalper with fixed risk SL.           |
 //+------------------------------------------------------------------+
 #property copyright "2026 AndroindDeve + AI"
-#property version   "10.1"
+#property version   "10.2"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -12,7 +12,7 @@ CTrade trade;
 //=== Inputs ==========================================================
 
 input group "Version"
-input string  EA_Version                 = "v10.1";
+input string  EA_Version                 = "v10.2";
 
 input group "Profit and risk"
 input double  BaseLot                    = 0.01;
@@ -43,6 +43,7 @@ input group "Execution filters"
 input int     MaxTotalPositions          = 20;
 input int     MaxPositionsPerSide        = 10;
 input int     MinSecondsBetweenEntries   = 45;
+input bool    ManageLegacyMagic          = true;   // Also manage positions opened by previous EA versions
 input bool    OneEntryPerM1Bar           = true;
 input bool    SignalOnlyOnNewM1Bar       = true;
 input bool    CloseOppositeOnStrongSignal = true;
@@ -762,9 +763,24 @@ bool IsOurPosition(ulong ticket)
       return false;
    if(PositionGetString(POSITION_SYMBOL) != _Symbol)
       return false;
-   if(PositionGetInteger(POSITION_MAGIC) != MAGIC)
+   if(!IsManagedMagic(PositionGetInteger(POSITION_MAGIC)))
       return false;
    return true;
+}
+
+//+------------------------------------------------------------------+
+bool IsManagedMagic(long magic)
+{
+   if(magic == MAGIC)
+      return true;
+   if(!ManageLegacyMagic)
+      return false;
+
+   // Previous iterations used these magic numbers; manual trades (magic 0) stay unmanaged.
+   return (magic == 20261000 ||
+           magic == 202604282 ||
+           magic == 202604281 ||
+           magic == 20260902);
 }
 
 //+------------------------------------------------------------------+
