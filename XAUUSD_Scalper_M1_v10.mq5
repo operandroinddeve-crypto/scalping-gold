@@ -396,7 +396,22 @@ double CalcSL(int direction, double atr_val, double ask, double bid)
       sl_dist = MathMax(atr_val * ATR_SL_Mult, FixedSL_Pips * PipSize * 0.5);
 
    double sl = (direction == 1) ? bid - sl_dist : ask + sl_dist;
+   sl = NormalizeStopForBroker(direction, sl, ask, bid);
    return NormalizeDouble(sl, _Digits);
+}
+
+//+------------------------------------------------------------------+
+double NormalizeStopForBroker(int direction, double sl, double ask, double bid)
+{
+   int stops_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   if(stops_level <= 0)
+      return sl;
+
+   double min_dist = stops_level * _Point;
+   if(direction == 1)
+      return MathMin(sl, bid - min_dist);
+
+   return MathMax(sl, ask + min_dist);
 }
 
 //+------------------------------------------------------------------+
