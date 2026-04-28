@@ -3,7 +3,7 @@
 //|  Microtick impulse basket scalper: strict M1 indicators + ticks   |
 //+------------------------------------------------------------------+
 #property copyright "2026 AndroindDeve + AI"
-#property version   "2.00"
+#property version   "2.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -17,6 +17,7 @@ input int    MaxBasketPositions         = 10;
 input double MaxLotPerBasket            = 0.10;
 input double BasketProfitTargetMoney    = 2.0;
 input double BasketMinCloseProfitMoney  = 0.20;
+input double BasketMaxLossMoney         = 8.0;    // Virtual basket guard; broker SL remains disabled
 input double MaxLossPctPerPosition      = 10.0;   // Close each position if its loss reaches this % of balance
 input int    MaxTotalPositions          = 10;
 
@@ -31,9 +32,13 @@ input int    StrongEntryPositions       = 10;
 input int    MinSecondsBetweenBaskets   = 2;
 input int    MinSecondsBetweenAdds      = 1;
 input bool   AddWhileImpulseContinues   = true;
+input bool   AvoidChasingExtremes       = true;
+input double ExtremeEntryBufferPips     = 1.5;
+input double MaxChaseBodyAtrPart        = 0.45;
 
 input group "Basket exit"
 input int    ReverseExitScore           = 7;
+input int    HardReverseExitScore       = 10;
 input double FadeVelocityPipsPerSec     = 0.03;
 input double ReverseTickPips            = 0.8;
 input bool   FlipOnStrongReverse        = true;
@@ -125,7 +130,7 @@ int OnInit()
    trade.SetDeviationInPoints(DeviationPoints);
    trade.SetAsyncMode(false);
 
-   Print("XAUUSD M1 TickScalper Pro v2.00 started. Microtick baskets, no SL/TP, per-position -",
+   Print("XAUUSD M1 TickScalper Pro v2.10 started. Microtick baskets, no SL/TP, per-position -",
          DoubleToString(MaxLossPctPerPosition, 1), "% protection.");
    return INIT_SUCCEEDED;
 }
@@ -269,6 +274,10 @@ MicroSignal BuildMicroSignal(double ask, double bid)
       return EmptySignal("score low " + DirStr(direction) + "=" + IntegerToString(score) +
                          " impulse=" + DoubleToString(impulse, 1));
 
+   if(IsEntryExhausted(direction, price, bb_up[0], bb_low[0], atr_pips))
+      return EmptySignal("exhausted " + DirStr(direction) +
+                         " near M1 extreme impulse=" + DoubleToString(impulse, 1));
+
    int positions = MediumEntryPositions;
    if(score >= StrongEntryScore)
       positions = StrongEntryPositions;
@@ -402,7 +411,22 @@ void ManageBasket(MicroSignal &sig)
       return;
    }
 
+   if(profit <= -BasketMaxLossMoney)
+   {
+      CloseBasket("basket loss limit=" + DoubleToString(profit, 2));
+      return;
+   }
+
    bool reverse = (sig.direction == -basket_dir && sig.score >= ReverseExitScore);
+   bool hard_reverse = (sig.direction == -basket_dir && sig.score >= HardReverseExitScore);
+   if(hard_reverse)
+   {
+      CloseBasket("hard reverse impulse profit=" + DoubleToString(profit, 2));
+      if(FlipOnStrongReverse && IsTradingSession())
+         OpenBasket(sig, SymbolInfoDouble(_Symbol, SYMBOL_ASK), SymbolInfoDouble(_Symbol, SYMBOL_BID));
+      return;
+   }
+
    bool fade = IsImpulseFadingAgainstBasket(basket_dir);
    if(profit >= BasketMinCloseProfitMoney && (reverse || fade))
    {
@@ -421,6 +445,40 @@ bool IsImpulseFadingAgainstBasket(int basket_dir)
       return (tick_velocity < FadeVelocityPipsPerSec && impulse <= -ReverseTickPips);
    if(basket_dir == -1)
       return (tick_velocity > -FadeVelocityPipsPerSec && impulse >= ReverseTickPips);
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool IsEntryExhausted(int direction, double price, double bb_up, double bb_low, double atr_pips)
+{
+   if(!AvoidChasingExtremes)
+      return false;
+
+   double high0 = iHigh(_Symbol, PERIOD_M1, 0);
+   double low0 = iLow(_Symbol, PERIOD_M1, 0);
+   double open0 = iOpen(_Symbol, PERIOD_M1, 0);
+   double close0 = iClose(_Symbol, PERIOD_M1, 0);
+   if(high0 <= 0.0 || low0 <= 0.0 || open0 <= 0.0 || close0 <= 0.0)
+      return false;
+
+   double body_pips = MathAbs(close0 - open0) / PipSize;
+   double max_chase_body = atr_pips * MaxChaseBodyAtrPart;
+   bool body_extended = (max_chase_body > 0.0 && body_pips >= max_chase_body);
+
+   if(direction == 1)
+   {
+      bool near_high = ((high0 - price) / PipSize <= ExtremeEntryBufferPips);
+      bool above_band = (bb_up > 0.0 && price >= bb_up);
+      return (near_high && body_extended) || above_band;
+   }
+
+   if(direction == -1)
+   {
+      bool near_low = ((price - low0) / PipSize <= ExtremeEntryBufferPips);
+      bool below_band = (bb_low > 0.0 && price <= bb_low);
+      return (near_low && body_extended) || below_band;
+   }
+
    return false;
 }
 
