@@ -1,27 +1,19 @@
 //+------------------------------------------------------------------+
 //|              XAUUSD_Scalper_M1_v11_0.mq5                         |
-//|  M1 GOLD scalper v11.1                                           |
+//|  M1 GOLD scalper v11.2                                           |
 //|                                                                   |
-//|  Fixed vs v10.x:                                                 |
-//|  [BUG] BlockNewEntryWhenInMarket was declared but never used     |
-//|  [BUG] PositionsForScore thresholds didn't match comments        |
-//|  [BUG] RSI scoring gave bonuses for contradictory zones          |
-//|  [BUG] Duplicate position-open check blocked all scaling         |
-//|  [BUG] MaxSpreadPips=3 blocked all XAUUSD entries (15+ is normal)|
-//|  [RISK] Risk now % of EQUITY with auto-calculated lot size       |
-//|  [RISK] Hard SL + TP in pips set on every order                 |
-//|  [RISK] Trailing stop + breakeven to lock profits                |
-//|  [RISK] Daily drawdown limit removed (disabled)                  |
-//|  [SIGNAL] H1 EMA(50) trend filter – no entries against H1 trend |
-//|  [SIGNAL] Fast MACD(3,10,3) replaces lagging MACD(12,26,9)     |
-//|  [SIGNAL] RSI(9) replaces RSI(14) for M1 responsiveness         |
-//|  [SIGNAL] EMA(9) replaces EMA(20) for faster M1 tracking        |
-//|  [LOGIC] Pyramid adds to PROFITABLE positions only              |
-//|  [LOGIC] CloseOppositeOnStrongSignal enabled by default          |
-//|  [LOGIC] No hedging by default (prevents stuck two-sided grid)  |
+//|  Fixed vs v11.1:                                                 |
+//|  [BUG] SL_Pips=20 was smaller than the spread (23p), causing    |
+//|         immediate stop-out on every trade                         |
+//|  [BUG] Fixed-pip SL/TP ignored XAUUSD volatility (ATR 150-300p) |
+//|  [FIX] SL/TP now ATR-based (SL=1.5*ATR, TP=2.0*ATR) and        |
+//|         self-adjust to current market conditions                  |
+//|  [FIX] Minimum SL enforced at spread*2 to avoid instant stops   |
+//|  [FIX] Lot size now calculated from ATR-based SL distance        |
+//|  [FIX] Breakeven and trailing thresholds use ATR fractions        |
 //+------------------------------------------------------------------+
 #property copyright "2026 AndroindDeve + AI"
-#property version   "11.1"
+#property version   "11.2"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -30,16 +22,20 @@ CTrade trade;
 //=== Inputs ==========================================================
 
 input group "Version"
-input string  EA_Version = "v11.1";
+input string  EA_Version = "v11.2";
 
 input group "Risk Management"
 input double  RiskPctPerTrade    = 1.0;   // % of EQUITY risked per position (SL-based)
 input double  MaxTotalRiskPct    = 4.0;   // Block new entries if approx open risk >= this %
-input double  SL_Pips            = 20.0;  // Fixed stop-loss in pips
-input double  TP_Pips            = 30.0;  // Fixed take-profit in pips (1.5 : 1 R:R)
-input double  BreakevenAt_Pips   = 12.0;  // Move SL to breakeven after this profit (pips)
-input double  TrailActivate_Pips = 18.0;  // Activate trailing stop after this profit (pips)
-input double  TrailStep_Pips     = 8.0;   // Trailing stop distance behind price (pips)
+// SL/TP are ATR-based: distance = ATR(14) * multiplier
+// For XAUUSD M1: ATR is typically 150-300 pips, so SL ~200-450p, TP ~270-600p
+input double  SL_ATR_Mult        = 1.5;   // SL distance = ATR * this (min: spread*2)
+input double  TP_ATR_Mult        = 2.0;   // TP distance = ATR * this → R:R = 1.33:1
+input double  MinSL_Pips         = 50.0;  // Absolute minimum SL in pips (safety floor)
+// Breakeven and trailing also use ATR fractions
+input double  BreakevenAt_ATR    = 0.6;   // Move SL to breakeven when profit >= ATR*this
+input double  TrailActivate_ATR  = 0.9;   // Activate trailing stop when profit >= ATR*this
+input double  TrailStep_ATR      = 0.4;   // Trail distance = ATR * this
 
 input group "Signal sizing"
 input int     WeakSignal_Positions   = 1; // score  8-9  → 1 position
@@ -170,8 +166,11 @@ int OnInit()
    trade.SetAsyncMode(false);
 
    Print("XAUUSD Scalper M1 ", EA_Version, " started.",
-         " Risk=", RiskPctPerTrade, "% SL=", SL_Pips, "p TP=", TP_Pips, "p",
-         " H1Filter=", UseH1Filter, " MaxSpread=", MaxSpreadPips, "p");
+         " Risk=", RiskPctPerTrade,
+         "% SL=", SL_ATR_Mult, "xATR TP=", TP_ATR_Mult, "xATR",
+         " MinSL=", MinSL_Pips, "p",
+         " H1Filter=", UseH1Filter,
+         " MaxSpread=", MaxSpreadPips, "p");
    return INIT_SUCCEEDED;
 }
 
@@ -538,12 +537,14 @@ void ExecuteSignal(SignalData &sig, double ask, double bid)
 //           emergency close at broker level.
 void ManagePositions()
 {
-   if(SL_Pips <= 0.0 && TP_Pips <= 0.0 &&
-      BreakevenAt_Pips <= 0.0 && TrailActivate_Pips <= 0.0)
-      return;
-
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double atr = GetCurrentATR();
+
+   // ATR-based thresholds in price units
+   double be_dist    = (BreakevenAt_ATR  > 0.0) ? atr * BreakevenAt_ATR  : 0.0;
+   double trail_act  = (TrailActivate_ATR > 0.0) ? atr * TrailActivate_ATR : 0.0;
+   double trail_step = (TrailStep_ATR    > 0.0) ? atr * TrailStep_ATR    : 0.0;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -556,66 +557,52 @@ void ManagePositions()
       double cur_sl     = PositionGetDouble(POSITION_SL);
       double cur_tp     = PositionGetDouble(POSITION_TP);
 
-      double current_price = (pos_type == POSITION_TYPE_BUY) ? bid : ask;
-      double profit_pips   = (pos_type == POSITION_TYPE_BUY)
-                            ? (bid - open_price) / PipSize
-                            : (open_price - ask) / PipSize;
+      double profit_dist = (pos_type == POSITION_TYPE_BUY)
+                          ? bid - open_price
+                          : open_price - ask;
+      double profit_pips = profit_dist / PipSize;
 
       double new_sl = cur_sl;
       bool   modify = false;
 
-      // Step 1: Breakeven – move SL to open_price when profit >= BreakevenAt_Pips
-      if(BreakevenAt_Pips > 0.0 && profit_pips >= BreakevenAt_Pips)
+      // Step 1: Breakeven – move SL to open_price once profit >= ATR * BreakevenAt_ATR
+      if(be_dist > 0.0 && profit_dist >= be_dist)
       {
          double be_sl;
          if(pos_type == POSITION_TYPE_BUY)
          {
             be_sl = NormalizeDouble(open_price + _Point, _Digits);
-            if(be_sl > cur_sl + _Point)
-            {
-               new_sl = be_sl;
-               modify = true;
-            }
+            if(be_sl > cur_sl + _Point) { new_sl = be_sl; modify = true; }
          }
          else
          {
             be_sl = NormalizeDouble(open_price - _Point, _Digits);
-            if(cur_sl <= 0.0 || be_sl < cur_sl - _Point)
-            {
-               new_sl = be_sl;
-               modify = true;
-            }
+            if(cur_sl <= 0.0 || be_sl < cur_sl - _Point) { new_sl = be_sl; modify = true; }
          }
       }
 
-      // Step 2: Trailing stop – trail behind price once TrailActivate_Pips reached
-      if(TrailActivate_Pips > 0.0 && profit_pips >= TrailActivate_Pips && TrailStep_Pips > 0.0)
+      // Step 2: Trailing stop – activates at ATR*TrailActivate_ATR, trails ATR*TrailStep_ATR
+      if(trail_act > 0.0 && profit_dist >= trail_act && trail_step > 0.0)
       {
          double trail_sl;
          if(pos_type == POSITION_TYPE_BUY)
          {
-            trail_sl = NormalizeDouble(bid - TrailStep_Pips * PipSize, _Digits);
-            if(trail_sl > new_sl + _Point)
-            {
-               new_sl = trail_sl;
-               modify = true;
-            }
+            trail_sl = NormalizeDouble(bid - trail_step, _Digits);
+            if(trail_sl > new_sl + _Point) { new_sl = trail_sl; modify = true; }
          }
          else
          {
-            trail_sl = NormalizeDouble(ask + TrailStep_Pips * PipSize, _Digits);
-            if(cur_sl <= 0.0 || trail_sl < new_sl - _Point)
-            {
-               new_sl = trail_sl;
-               modify = true;
-            }
+            trail_sl = NormalizeDouble(ask + trail_step, _Digits);
+            if(cur_sl <= 0.0 || trail_sl < new_sl - _Point) { new_sl = trail_sl; modify = true; }
          }
       }
 
       if(modify)
       {
          if(trade.PositionModify(ticket, new_sl, cur_tp))
-            Print("SL_MODIFY ticket=", ticket, " profitPips=", DoubleToString(profit_pips, 1),
+            Print("SL_MODIFY ticket=", ticket,
+                  " profitPips=", DoubleToString(profit_pips, 1),
+                  " ATRpips=", DoubleToString(atr / PipSize, 1),
                   " newSL=", DoubleToString(new_sl, _Digits));
       }
    }
@@ -850,27 +837,52 @@ bool IsH1TrendAligned(int direction)
 }
 
 //+------------------------------------------------------------------+
-// [UPDATED] CalcSL: pips-based (fixed distance), not percentage-of-balance
+// GetCurrentATR: read latest completed-bar ATR value
+double GetCurrentATR()
+{
+   double atr[];
+   ArraySetAsSeries(atr, true);
+   if(CopyBuffer(h_atr, 0, 0, 3, atr) < 2 || atr[1] <= 0.0)
+      return MinSL_Pips * PipSize; // fallback
+   return atr[1];
+}
+
+//+------------------------------------------------------------------+
+// CalcSLDist: returns SL distance in price (not pips)
+// = max(ATR*SL_ATR_Mult, MinSL_Pips*PipSize, spread*2)
+double CalcSLDist(double ask, double bid)
+{
+   double atr    = GetCurrentATR();
+   double spread = ask - bid;
+   double dist   = atr * SL_ATR_Mult;
+   dist = MathMax(dist, MinSL_Pips * PipSize);  // floor in pips
+   dist = MathMax(dist, spread * 2.0);           // must clear spread 2x
+   return dist;
+}
+
+//+------------------------------------------------------------------+
+// [FIX] CalcSL: ATR-based SL, always > spread
 double CalcSL(int direction, double ask, double bid)
 {
-   double sl_dist = SL_Pips * PipSize;
+   double sl_dist = CalcSLDist(ask, bid);
    double sl      = (direction == 1) ? bid - sl_dist : ask + sl_dist;
    sl = NormalizeInitialStop(direction, sl, ask, bid);
    return NormalizeDouble(sl, _Digits);
 }
 
 //+------------------------------------------------------------------+
-// [NEW] CalcTP: pips-based take-profit
+// [FIX] CalcTP: ATR-based TP (TP_ATR_Mult * ATR from entry)
 double CalcTP(int direction, double ask, double bid)
 {
-   if(TP_Pips <= 0.0) return 0.0;
-   double tp = (direction == 1) ? ask + TP_Pips * PipSize
-                                : bid - TP_Pips * PipSize;
+   if(TP_ATR_Mult <= 0.0) return 0.0;
+   double atr  = GetCurrentATR();
+   double dist = atr * TP_ATR_Mult;
+   double tp   = (direction == 1) ? ask + dist : bid - dist;
    return NormalizeDouble(tp, _Digits);
 }
 
 //+------------------------------------------------------------------+
-// [NEW] CalcLot: auto-size lot based on equity risk % and fixed SL in pips
+// [FIX] CalcLot: lot sized from equity risk % and actual ATR-based SL
 double CalcLot()
 {
    double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -879,14 +891,19 @@ double CalcLot()
    double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tick_size  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
 
-   if(tick_value <= 0.0 || tick_size <= 0.0 || SL_Pips <= 0.0)
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   double sl_dist_price = CalcSLDist(ask, bid); // price units
+   if(sl_dist_price <= 0.0 || tick_value <= 0.0 || tick_size <= 0.0)
       return NormLot(0.01);
 
-   double pip_value_per_lot = (tick_value / tick_size) * PipSize;
-   if(pip_value_per_lot <= 0.0)
+   // P&L per lot per 1 price unit = tick_value / tick_size
+   double val_per_price_unit = tick_value / tick_size;
+   if(val_per_price_unit <= 0.0)
       return NormLot(0.01);
 
-   double lot = risk_money / (SL_Pips * pip_value_per_lot);
+   double lot = risk_money / (sl_dist_price * val_per_price_unit);
    return NormLot(lot);
 }
 
