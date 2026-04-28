@@ -898,12 +898,8 @@ double NormalizeInitialStop(int direction, double sl, double ask, double bid)
 }
 
 //+------------------------------------------------------------------+
-// [UPDATED] CanOpenNewEntry: checks daily limit and total open risk
 bool CanOpenNewEntry()
 {
-   // Approximate open risk guard
-   if((double)CountOurPositions() * RiskPctPerTrade >= MaxTotalRiskPct) return false;
-
    if(TimeCurrent() - last_entry_time < MinSecondsBetweenEntries) return false;
 
    if(OneEntryPerM1Bar)
