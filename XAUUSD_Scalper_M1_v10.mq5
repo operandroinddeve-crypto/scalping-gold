@@ -3,7 +3,7 @@
 //|  Strict M1 scalper for XAUUSD: M1 indicators + tick management   |
 //+------------------------------------------------------------------+
 #property copyright "2026 AndroindDeve + AI"
-#property version   "11.00"
+#property version   "11.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -14,10 +14,15 @@ CTrade trade;
 input group "Profit and protection"
 input double  ProfitTarget          = 1.5;    // Per-position profit target in account currency
 input double  MaxLossPct            = 7.0;    // Max loss per position, % of balance
-input double  AvgDrawdownPct        = 0.5;    // Position drawdown, % of balance, to average
-input bool    UseAveraging          = false;  // Averaging is high risk; keep disabled unless tested
+input double  AvgDrawdownPct        = 0.5;    // Position drawdown, % of balance, to allow pullback add
+input bool    UseAveraging          = true;   // Smart pullback add, not blind averaging
 input int     MaxAvgLevels          = 3;
-input double  AvgLotMult            = 1.5;
+input double  AvgLotMult            = 1.2;
+input int     PullbackAddMinScore   = 6;      // M1 signal score required in same direction
+input double  PullbackMinPips       = 3.0;    // Min adverse move from side average price
+input double  PullbackZonePips      = 2.0;    // Price must be near current M1 low/high or EMA/BB zone
+input double  PullbackAtrPart       = 0.25;   // ATR part allowed around EMA/BB pullback zone
+input int     MinSecondsBetweenAdds = 45;
 
 input group "Trailing stop"
 input bool    UseTrailing           = true;
@@ -90,6 +95,8 @@ double   PipSize            = 0.0;
 datetime last_m1_bar_time   = 0;
 datetime last_entry_time    = 0;
 datetime last_entry_bar     = 0;
+datetime last_avg_buy_time   = 0;
+datetime last_avg_sell_time  = 0;
 int      last_direction     = 0;
 int      avg_levels_buy     = 0;
 int      avg_levels_sell    = 0;
@@ -130,7 +137,7 @@ int OnInit()
    trade.SetDeviationInPoints(30);
    trade.SetAsyncMode(false);
 
-   Print("XAUUSD Scalper M1 Classic v11.00 started. Score-based logic, PERIOD_M1 indicators only.");
+   Print("XAUUSD Scalper M1 Classic v11.10 started. Score-based logic, PERIOD_M1 indicators only.");
    return INIT_SUCCEEDED;
 }
 
@@ -151,8 +158,6 @@ void OnTick()
 {
    ManagePositions();
    ApplyTrailing();
-   if(UseAveraging)
-      CheckAveraging();
 
    if(!IsTradingSession())
       return;
@@ -161,6 +166,9 @@ void OnTick()
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    if(ask <= 0 || bid <= 0 || ask <= bid)
       return;
+
+   if(UseAveraging)
+      CheckSmartPullbackAdd(ask, bid);
 
    if(SignalOnlyOnNewM1Bar)
    {
@@ -609,48 +617,211 @@ void ApplyTrailing()
 }
 
 //+------------------------------------------------------------------+
-void CheckAveraging()
+void CheckSmartPullbackAdd(double ask, double bid)
 {
-   double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double threshold = balance * AvgDrawdownPct / 100.0;
-   bool did_buy = false;
-   bool did_sell = false;
+   if(threshold <= 0.0)
+      return;
+
+   TryPullbackAdd(1, ask, bid, threshold);
+   TryPullbackAdd(-1, ask, bid, threshold);
+}
+
+//+------------------------------------------------------------------+
+void TryPullbackAdd(int direction, double ask, double bid, double threshold)
+{
+   int side_count = CountOurPositionsByType(direction);
+   if(side_count <= 0 || side_count >= MaxPositionsPerSide)
+      return;
+
+   int levels = (direction == 1) ? avg_levels_buy : avg_levels_sell;
+   datetime last_add_time = (direction == 1) ? last_avg_buy_time : last_avg_sell_time;
+   if(levels >= MaxAvgLevels)
+      return;
+   if(TimeCurrent() - last_add_time < MinSecondsBetweenAdds)
+      return;
+
+   double side_profit = SideProfit(direction);
+   if(side_profit >= 0.0 || MathAbs(side_profit) < threshold)
+      return;
+
+   double avg_price = SideAverageOpenPrice(direction);
+   if(avg_price <= 0.0)
+      return;
+
+   double adverse_pips = (direction == 1) ? (avg_price - bid) / PipSize
+                                          : (ask - avg_price) / PipSize;
+   if(adverse_pips < PullbackMinPips)
+      return;
+
+   if(!IsM1DirectionStillValid(direction))
+      return;
+
+   if(!IsPullbackZone(direction, ask, bid))
+      return;
+
+   double atr[];
+   if(!SafeCopy(h_atr_m1, 0, atr, 3))
+      return;
+
+   double lot = NormLot(BaseLot * MathPow(AvgLotMult, levels));
+   double sl = CalcSL(direction, atr[1], ask, bid);
+   bool ok = false;
+   ResetLastError();
+
+   if(direction == 1)
+      ok = trade.Buy(lot, _Symbol, ask, sl, 0.0, "M1 pullback buy");
+   else
+      ok = trade.Sell(lot, _Symbol, bid, sl, 0.0, "M1 pullback sell");
+
+   if(ok)
+   {
+      if(direction == 1)
+      {
+         avg_levels_buy++;
+         last_avg_buy_time = TimeCurrent();
+      }
+      else
+      {
+         avg_levels_sell++;
+         last_avg_sell_time = TimeCurrent();
+      }
+      last_entry_time = TimeCurrent();
+      last_entry_bar = iTime(_Symbol, PERIOD_M1, 0);
+      Print("PULLBACK_ADD ", DirStr(direction),
+            " level=", levels + 1,
+            " lot=", DoubleToString(lot, 2),
+            " side_profit=", DoubleToString(side_profit, 2),
+            " adverse=", DoubleToString(adverse_pips, 1),
+            " SL=", DoubleToString(sl, _Digits));
+   }
+   else
+   {
+      Print("Pullback add failed retcode=", trade.ResultRetcode(),
+            " desc=", trade.ResultRetcodeDescription(),
+            " last_error=", GetLastError());
+   }
+}
+
+//+------------------------------------------------------------------+
+bool IsM1DirectionStillValid(int direction)
+{
+   double ema[], adx_main[], adx_plus[], adx_minus[], rsi[], macd_m[], macd_s[], stoch_k[], stoch_d[];
+
+   if(!SafeCopy(h_ema20_m1, 0, ema,       EMA_Slope_Bars + 2)) return false;
+   if(!SafeCopy(h_adx_m1,   0, adx_main,  4)) return false;
+   if(!SafeCopy(h_adx_m1,   1, adx_plus,  4)) return false;
+   if(!SafeCopy(h_adx_m1,   2, adx_minus, 4)) return false;
+   if(!SafeCopy(h_rsi_m1,   0, rsi,       4)) return false;
+   if(!SafeCopy(h_macd_m1,  0, macd_m,    4)) return false;
+   if(!SafeCopy(h_macd_m1,  1, macd_s,    4)) return false;
+   if(!SafeCopy(h_stoch_m1, 0, stoch_k,   4)) return false;
+   if(!SafeCopy(h_stoch_m1, 1, stoch_d,   4)) return false;
+
+   if(adx_main[1] < ADX_Min)
+      return false;
+
+   double price = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) + SymbolInfoDouble(_Symbol, SYMBOL_BID)) * 0.5;
+   double slope = (ema[0] - ema[EMA_Slope_Bars]) / PipSize;
+   double macd_hist = macd_m[1] - macd_s[1];
+
+   if(direction == 1)
+   {
+      if(price < ema[0] && slope < 0.0) return false;
+      if(RequireDIDirection && adx_plus[1] <= adx_minus[1]) return false;
+      if(macd_hist < 0.0 && rsi[1] < 50.0) return false;
+      if(stoch_k[1] < stoch_d[1] && rsi[1] < 48.0) return false;
+      return true;
+   }
+
+   if(price > ema[0] && slope > 0.0) return false;
+   if(RequireDIDirection && adx_minus[1] <= adx_plus[1]) return false;
+   if(macd_hist > 0.0 && rsi[1] > 50.0) return false;
+   if(stoch_k[1] > stoch_d[1] && rsi[1] > 52.0) return false;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+bool IsPullbackZone(int direction, double ask, double bid)
+{
+   double ema[], bb_up[], bb_mid[], bb_low[], atr[];
+   if(!SafeCopy(h_ema20_m1, 0, ema,    3)) return false;
+   if(!SafeCopy(h_bb_m1,    0, bb_up,  3)) return false;
+   if(!SafeCopy(h_bb_m1,    1, bb_mid, 3)) return false;
+   if(!SafeCopy(h_bb_m1,    2, bb_low, 3)) return false;
+   if(!SafeCopy(h_atr_m1,   0, atr,    3)) return false;
+
+   double price = (ask + bid) * 0.5;
+   double atr_pips = atr[1] / PipSize;
+   double max_dist = MathMax(PullbackZonePips, atr_pips * PullbackAtrPart);
+   double open0 = iOpen(_Symbol, PERIOD_M1, 0);
+   double high0 = iHigh(_Symbol, PERIOD_M1, 0);
+   double low0  = iLow(_Symbol, PERIOD_M1, 0);
+   double close0 = iClose(_Symbol, PERIOD_M1, 0);
+
+   if(open0 <= 0.0 || high0 <= 0.0 || low0 <= 0.0 || close0 <= 0.0)
+      return false;
+
+   if(direction == 1)
+   {
+      bool bearish_pullback = close0 < open0;
+      bool near_support = (MathAbs(price - ema[0]) / PipSize <= max_dist) ||
+                          (MathAbs(price - bb_mid[0]) / PipSize <= max_dist) ||
+                          ((price - low0) / PipSize <= ExtremeBuffer_Pips);
+      bool not_chasing_high = ((high0 - price) / PipSize > ExtremeBuffer_Pips);
+      return bearish_pullback && near_support && not_chasing_high;
+   }
+
+   bool bullish_pullback = close0 > open0;
+   bool near_resistance = (MathAbs(price - ema[0]) / PipSize <= max_dist) ||
+                          (MathAbs(price - bb_mid[0]) / PipSize <= max_dist) ||
+                          ((high0 - price) / PipSize <= ExtremeBuffer_Pips);
+   bool not_chasing_low = ((price - low0) / PipSize > ExtremeBuffer_Pips);
+   return bullish_pullback && near_resistance && not_chasing_low;
+}
+
+//+------------------------------------------------------------------+
+double SideProfit(int direction)
+{
+   double profit = 0.0;
+   long wanted = (direction == 1) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
       if(!IsOurPosition(ticket))
          continue;
+      if(PositionGetInteger(POSITION_TYPE) == wanted)
+         profit += PositionGetDouble(POSITION_PROFIT);
+   }
 
-      double profit = PositionGetDouble(POSITION_PROFIT);
-      long   ptype  = PositionGetInteger(POSITION_TYPE);
-      if(profit >= 0.0 || MathAbs(profit) < threshold)
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+double SideAverageOpenPrice(int direction)
+{
+   double weighted_sum = 0.0;
+   double volume_sum = 0.0;
+   long wanted = (direction == 1) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!IsOurPosition(ticket))
+         continue;
+      if(PositionGetInteger(POSITION_TYPE) != wanted)
          continue;
 
-      if(ptype == POSITION_TYPE_BUY && !did_buy && avg_levels_buy < MaxAvgLevels)
-      {
-         double lot = NormLot(BaseLot * MathPow(AvgLotMult, avg_levels_buy + 1));
-         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-         if(trade.Buy(lot, _Symbol, ask, 0.0, 0.0, "M1 average buy"))
-         {
-            avg_levels_buy++;
-            did_buy = true;
-            Print("Average BUY level=", avg_levels_buy, " lot=", DoubleToString(lot, 2));
-         }
-      }
-
-      if(ptype == POSITION_TYPE_SELL && !did_sell && avg_levels_sell < MaxAvgLevels)
-      {
-         double lot = NormLot(BaseLot * MathPow(AvgLotMult, avg_levels_sell + 1));
-         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-         if(trade.Sell(lot, _Symbol, bid, 0.0, 0.0, "M1 average sell"))
-         {
-            avg_levels_sell++;
-            did_sell = true;
-            Print("Average SELL level=", avg_levels_sell, " lot=", DoubleToString(lot, 2));
-         }
-      }
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      weighted_sum += PositionGetDouble(POSITION_PRICE_OPEN) * volume;
+      volume_sum += volume;
    }
+
+   if(volume_sum <= 0.0)
+      return 0.0;
+   return weighted_sum / volume_sum;
 }
 
 //+------------------------------------------------------------------+
