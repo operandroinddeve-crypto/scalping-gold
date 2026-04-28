@@ -3,7 +3,7 @@
 //|  Strict M1 scalper for XAUUSD: M1 indicators + tick management   |
 //+------------------------------------------------------------------+
 #property copyright "2026 AndroindDeve + AI"
-#property version   "11.30"
+#property version   "11.40"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -13,7 +13,7 @@ CTrade trade;
 
 input group "Profit and protection"
 input double  ProfitTarget          = 1.5;    // Per-position profit target in account currency
-input double  MaxLossPct            = 7.0;    // Max loss per position, % of balance
+input double  MaxLossPct            = 9.0;    // Fixed SL / emergency close per position, % of balance
 input double  AvgDrawdownPct        = 0.5;    // Position drawdown, % of balance, to allow pullback add
 input bool    UseAveraging          = true;   // Smart pullback add, not blind averaging
 input int     MaxAvgLevels          = 3;
@@ -24,16 +24,11 @@ input double  PullbackZonePips      = 2.0;    // Price must be near current M1 l
 input double  PullbackAtrPart       = 0.25;   // ATR part allowed around EMA/BB pullback zone
 input int     MinSecondsBetweenAdds = 45;
 
-input group "Trailing stop"
-input bool    UseTrailing           = false;  // Disabled: broker rejected frequent SL modifications on GOLD
-input double  TrailStart_Pips       = 10.0;
-input double  TrailStep_Pips        = 5.0;
-
 input group "Stop loss"
-input bool    UseATR_SL             = true;
+input bool    UseMoneyRiskSL        = true;   // SL price targets MaxLossPct risk for the position lot
 input int     ATR_Period            = 14;
 input double  ATR_SL_Mult           = 1.5;
-input double  FixedSL_Pips          = 30.0;
+input double  FixedSL_Pips          = 30.0;   // Fallback if money-risk SL cannot be calculated
 
 input group "Lots"
 input double  BaseLot               = 0.01;
@@ -141,7 +136,7 @@ int OnInit()
    trade.SetDeviationInPoints(30);
    trade.SetAsyncMode(false);
 
-   Print("XAUUSD Scalper M1 Classic v11.30 started. Trailing disabled; score-based PERIOD_M1 logic.");
+   Print("XAUUSD Scalper M1 Classic v11.40 started. No trailing; fixed money-risk SL per position.");
    return INIT_SUCCEEDED;
 }
 
@@ -161,7 +156,6 @@ void OnDeinit(const int reason)
 void OnTick()
 {
    ManagePositions();
-   ApplyTrailing();
    PrintOpenPositionsDebug();
 
    if(!IsTradingSession())
@@ -437,7 +431,7 @@ SignalData AnalyzeSignal(double &ema20[],
    sig.direction = direction;
    sig.score     = score;
    sig.positions = positions;
-   sig.sl_price  = CalcSL(direction, atr[1], ask, bid);
+   sig.sl_price  = CalcSL(direction, atr[1], ask, bid, BaseLot);
    return sig;
 }
 
@@ -479,10 +473,18 @@ bool IsEntryOverextended(int direction, double price, double atr_value,
 }
 
 //+------------------------------------------------------------------+
-double CalcSL(int direction, double atr_val, double ask, double bid)
+double CalcSL(int direction, double atr_val, double ask, double bid, double lot)
 {
    double sl_dist = FixedSL_Pips * PipSize;
-   if(UseATR_SL && atr_val > 0.0)
+   if(UseMoneyRiskSL)
+   {
+      double risk_money = AccountInfoDouble(ACCOUNT_BALANCE) * MaxLossPct / 100.0;
+      double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+      double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+      if(risk_money > 0.0 && tick_value > 0.0 && tick_size > 0.0 && lot > 0.0)
+         sl_dist = (risk_money / (tick_value * lot)) * tick_size;
+   }
+   else if(UseATR_SL && atr_val > 0.0)
       sl_dist = MathMax(atr_val * ATR_SL_Mult, FixedSL_Pips * PipSize * 0.5);
 
    double sl = (direction == 1) ? bid - sl_dist : ask + sl_dist;
@@ -642,7 +644,7 @@ void TryPullbackAdd(int direction, double ask, double bid, double threshold)
       return;
 
    double lot = NormLot(BaseLot * MathPow(AvgLotMult, levels));
-   double sl = CalcSL(direction, atr[1], ask, bid);
+   double sl = CalcSL(direction, atr[1], ask, bid, lot);
    bool ok = false;
    ResetLastError();
 
