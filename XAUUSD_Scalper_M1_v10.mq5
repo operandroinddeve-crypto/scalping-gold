@@ -3,7 +3,7 @@
 //|  Strict M1 scalper for XAUUSD: M1 indicators + tick management   |
 //+------------------------------------------------------------------+
 #property copyright "2026 AndroindDeve + AI"
-#property version   "10.01"
+#property version   "11.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -13,7 +13,7 @@ CTrade trade;
 
 input group "Profit and protection"
 input double  ProfitTarget          = 1.5;    // Per-position profit target in account currency
-input double  MaxLossPct            = 2.0;    // Max loss per position, % of balance
+input double  MaxLossPct            = 7.0;    // Max loss per position, % of balance
 input double  AvgDrawdownPct        = 0.5;    // Position drawdown, % of balance, to average
 input bool    UseAveraging          = false;  // Averaging is high risk; keep disabled unless tested
 input int     MaxAvgLevels          = 3;
@@ -36,16 +36,23 @@ input double  MaxLotPerSignal       = 0.10;
 
 input group "Signal sizing"
 input int     WeakSignal_Pos        = 1;      // 1-4 points
-input int     MedSignal_Pos         = 2;      // 5-7 points
-input int     StrongSignal_Pos      = 3;      // 8+ points
+input int     MedSignal_Pos         = 3;      // 5-7 points
+input int     StrongSignal_Pos      = 6;      // 8+ points
 
 input group "Execution filters"
 input double  SpreadAtrReduce_1     = 0.35;   // Spread/ATR above this reduces position count by 1
 input double  SpreadAtrReduce_2     = 0.70;   // Spread/ATR above this reduces position count by 2
-input int     MaxTotalPositions     = 12;
-input int     MaxPositionsPerSide   = 6;
-input int     MinSecondsBetweenEntries = 20;
+input int     MaxTotalPositions     = 20;
+input int     MaxPositionsPerSide   = 10;
+input int     MinSecondsBetweenEntries = 45;
 input bool    OneEntryPerM1Bar      = true;
+input bool    SignalOnlyOnNewM1Bar  = true;   // Stable classic mode: one signal decision per M1 candle
+input bool    RequireDIDirection    = true;   // DI must confirm EMA direction
+input bool    AvoidChasingExtremes  = true;   // Do not buy M1 highs or sell M1 lows
+input double  ExtremeBuffer_Pips    = 1.5;
+input double  MaxChaseBodyAtrPart   = 0.45;
+input bool    CloseOppositeOnStrongSignal = true;
+input int     OppositeCloseMinScore = 7;
 input int     GMT_Offset            = 3;
 input int     Session_Start_H       = 7;
 input int     Session_End_H         = 21;
@@ -123,7 +130,7 @@ int OnInit()
    trade.SetDeviationInPoints(30);
    trade.SetAsyncMode(false);
 
-   Print("XAUUSD Scalper M1 v10.01 started. Spread never blocks entries; PERIOD_M1 indicators, tick management enabled.");
+   Print("XAUUSD Scalper M1 Classic v11.00 started. Score-based logic, PERIOD_M1 indicators only.");
    return INIT_SUCCEEDED;
 }
 
@@ -155,6 +162,14 @@ void OnTick()
    if(ask <= 0 || bid <= 0 || ask <= bid)
       return;
 
+   if(SignalOnlyOnNewM1Bar)
+   {
+      datetime bar_time = iTime(_Symbol, PERIOD_M1, 0);
+      if(bar_time == last_m1_bar_time)
+         return;
+      last_m1_bar_time = bar_time;
+   }
+
    if(CountOurPositions() >= MaxTotalPositions)
       return;
 
@@ -163,7 +178,7 @@ void OnTick()
 
    SignalData sig = ReadAndAnalyzeSignal(ask, bid);
 
-   if(DebugMode && IsNewM1Bar())
+   if(DebugMode)
    {
       Print("M1 signal: ", DirStr(sig.direction),
             " score=", sig.score,
@@ -281,6 +296,13 @@ SignalData AnalyzeSignal(double &ema20[],
 
    bool di_bull = (adx_plus[1] > adx_minus[1]);
    bool di_bear = (adx_minus[1] > adx_plus[1]);
+   if(RequireDIDirection &&
+      ((direction == 1 && !di_bull) || (direction == -1 && !di_bear)))
+   {
+      sig.reason += "DI_required_against ";
+      return sig;
+   }
+
    if(direction == 1 && di_bull)  { score += (adx_main[1] > 30.0 ? 2 : 1); sig.reason += "ADX_DI_buy "; }
    if(direction == -1 && di_bear) { score += (adx_main[1] > 30.0 ? 2 : 1); sig.reason += "ADX_DI_sell "; }
    if(direction == 1 && !di_bull)  { score -= 1; sig.reason += "DI_against "; }
@@ -351,6 +373,12 @@ SignalData AnalyzeSignal(double &ema20[],
    else
       { score -= 1; sig.reason += "micro_against "; }
 
+   if(IsEntryOverextended(direction, price_now, atr[1], bb_up[0], bb_lo[0]))
+   {
+      sig.reason += "avoid_chasing_extreme ";
+      return sig;
+   }
+
    if(score < 4)
    {
       sig.reason += "score_too_low=" + IntegerToString(score);
@@ -397,6 +425,43 @@ SignalData AnalyzeSignal(double &ema20[],
 }
 
 //+------------------------------------------------------------------+
+bool IsEntryOverextended(int direction, double price, double atr_value,
+                         double bb_up, double bb_low)
+{
+   if(!AvoidChasingExtremes)
+      return false;
+
+   double open0 = iOpen(_Symbol, PERIOD_M1, 0);
+   double high0 = iHigh(_Symbol, PERIOD_M1, 0);
+   double low0  = iLow(_Symbol, PERIOD_M1, 0);
+   double close0 = iClose(_Symbol, PERIOD_M1, 0);
+   if(open0 <= 0.0 || high0 <= 0.0 || low0 <= 0.0 || close0 <= 0.0)
+      return false;
+
+   double body_pips = MathAbs(close0 - open0) / PipSize;
+   double atr_pips = (atr_value > 0.0) ? atr_value / PipSize : 0.0;
+   double max_body = MathMax(ExtremeBuffer_Pips, atr_pips * MaxChaseBodyAtrPart);
+   if(body_pips < max_body)
+      return false;
+
+   if(direction == 1)
+   {
+      bool near_high = ((high0 - price) / PipSize <= ExtremeBuffer_Pips);
+      bool near_upper_band = (bb_up > 0.0 && price >= bb_up - ExtremeBuffer_Pips * PipSize);
+      return near_high || near_upper_band;
+   }
+
+   if(direction == -1)
+   {
+      bool near_low = ((price - low0) / PipSize <= ExtremeBuffer_Pips);
+      bool near_lower_band = (bb_low > 0.0 && price <= bb_low + ExtremeBuffer_Pips * PipSize);
+      return near_low || near_lower_band;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
 double CalcSL(int direction, double atr_val, double ask, double bid)
 {
    double sl_dist = FixedSL_Pips * PipSize;
@@ -425,6 +490,9 @@ double NormalizeStopForBroker(int direction, double sl, double ask, double bid)
 //+------------------------------------------------------------------+
 void ExecuteSignal(SignalData &sig, double ask, double bid)
 {
+   if(CloseOppositeOnStrongSignal && sig.score >= OppositeCloseMinScore)
+      CloseOppositePositions(sig.direction);
+
    int opened = 0;
    double lot = NormLot(BaseLot);
 
@@ -679,6 +747,25 @@ int CountOurPositionsByType(int direction)
          n++;
    }
    return n;
+}
+
+//+------------------------------------------------------------------+
+void CloseOppositePositions(int direction)
+{
+   long opposite = (direction == 1) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!IsOurPosition(ticket))
+         continue;
+      if(PositionGetInteger(POSITION_TYPE) != opposite)
+         continue;
+
+      double profit = PositionGetDouble(POSITION_PROFIT);
+      if(trade.PositionClose(ticket))
+         Print("Closed opposite ticket=", ticket, " profit=", DoubleToString(profit, 2));
+   }
 }
 
 //+------------------------------------------------------------------+
