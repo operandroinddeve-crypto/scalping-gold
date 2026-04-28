@@ -3,7 +3,7 @@
 //|  Strict M1 scalper for XAUUSD: M1 indicators + tick management   |
 //+------------------------------------------------------------------+
 #property copyright "2026 AndroindDeve + AI"
-#property version   "11.10"
+#property version   "11.20"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -79,6 +79,8 @@ input double  MinMicroRange_Pips    = 3.0;    // Skip dead tape
 
 input group "Debug"
 input bool    DebugMode             = true;
+input bool    DebugOpenPositions    = true;   // Print side summary on every signal bar
+input int     DebugPositionsEverySeconds = 30;
 
 //=== Indicator handles ==============================================
 int h_ema20_m1 = INVALID_HANDLE;
@@ -97,6 +99,8 @@ datetime last_entry_time    = 0;
 datetime last_entry_bar     = 0;
 datetime last_avg_buy_time   = 0;
 datetime last_avg_sell_time  = 0;
+datetime last_positions_debug_time = 0;
+datetime last_trailing_error_time  = 0;
 int      last_direction     = 0;
 int      avg_levels_buy     = 0;
 int      avg_levels_sell    = 0;
@@ -137,7 +141,7 @@ int OnInit()
    trade.SetDeviationInPoints(30);
    trade.SetAsyncMode(false);
 
-   Print("XAUUSD Scalper M1 Classic v11.10 started. Score-based logic, PERIOD_M1 indicators only.");
+   Print("XAUUSD Scalper M1 Classic v11.20 started. Score-based logic, PERIOD_M1 indicators only.");
    return INIT_SUCCEEDED;
 }
 
@@ -158,6 +162,7 @@ void OnTick()
 {
    ManagePositions();
    ApplyTrailing();
+   PrintOpenPositionsDebug();
 
    if(!IsTradingSession())
       return;
@@ -178,6 +183,8 @@ void OnTick()
       last_m1_bar_time = bar_time;
    }
 
+   PrintOpenPositionsDebug();
+
    if(CountOurPositions() >= MaxTotalPositions)
       return;
 
@@ -193,6 +200,8 @@ void OnTick()
             " positions=", sig.positions,
             " SL=", DoubleToString(sig.sl_price, _Digits),
             " | ", sig.reason);
+      if(DebugOpenPositions)
+         PrintOpenPositionsDebug();
    }
 
    if(sig.direction != 0)
@@ -537,10 +546,13 @@ void ExecuteSignal(SignalData &sig, double ask, double bid)
       else
          avg_levels_sell = 0;
 
-      Print("Opened ", opened, " ", DirStr(sig.direction),
+      Print("OPEN_SIGNAL ", DirStr(sig.direction),
+            " opened=", opened,
+            " requested=", sig.positions,
+            " lot=", DoubleToString(lot, 2),
             " score=", sig.score,
             " SL=", DoubleToString(sig.sl_price, _Digits),
-            " | ", sig.reason);
+            " reason=", sig.reason);
    }
 }
 
@@ -581,6 +593,7 @@ void ApplyTrailing()
 
    double trail_start = TrailStart_Pips * PipSize;
    double trail_step  = TrailStep_Pips  * PipSize;
+   double min_stop_distance = BrokerStopDistance();
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -597,22 +610,62 @@ void ApplyTrailing()
 
       if(ptype == POSITION_TYPE_BUY)
       {
-         double new_sl = NormalizeDouble(bid - trail_step, _Digits);
+         double new_sl = NormalizeDouble(bid - MathMax(trail_step, min_stop_distance), _Digits);
          if(bid - open_p >= trail_start && (sl_cur == 0.0 || new_sl > sl_cur + _Point))
          {
-            if(!trade.PositionModify(ticket, new_sl, tp_cur))
-               Print("Trailing BUY failed retcode=", trade.ResultRetcodeDescription());
+            SafeModifyPositionSL(ticket, 1, new_sl, tp_cur, bid, ask);
          }
       }
       else if(ptype == POSITION_TYPE_SELL)
       {
-         double new_sl = NormalizeDouble(ask + trail_step, _Digits);
+         double new_sl = NormalizeDouble(ask + MathMax(trail_step, min_stop_distance), _Digits);
          if(open_p - ask >= trail_start && (sl_cur == 0.0 || new_sl < sl_cur - _Point))
          {
-            if(!trade.PositionModify(ticket, new_sl, tp_cur))
-               Print("Trailing SELL failed retcode=", trade.ResultRetcodeDescription());
+            SafeModifyPositionSL(ticket, -1, new_sl, tp_cur, bid, ask);
          }
       }
+   }
+}
+
+//+------------------------------------------------------------------+
+double BrokerStopDistance()
+{
+   int stops_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   int freeze_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   int min_points = MathMax(stops_level, freeze_level) + 2;
+   return MathMax(min_points * _Point, _Point);
+}
+
+//+------------------------------------------------------------------+
+bool IsStopAllowed(int direction, double sl, double bid, double ask)
+{
+   double min_dist = BrokerStopDistance();
+   if(direction == 1)
+      return (sl > 0.0 && bid - sl >= min_dist);
+   if(direction == -1)
+      return (sl > 0.0 && sl - ask >= min_dist);
+   return false;
+}
+
+//+------------------------------------------------------------------+
+void SafeModifyPositionSL(ulong ticket, int direction, double sl, double tp,
+                          double bid, double ask)
+{
+   if(!IsStopAllowed(direction, sl, bid, ask))
+      return;
+
+   ResetLastError();
+   if(trade.PositionModify(ticket, sl, tp))
+      return;
+
+   if(TimeCurrent() - last_trailing_error_time >= 30)
+   {
+      last_trailing_error_time = TimeCurrent();
+      Print("Trailing modify skipped/failed ticket=", ticket,
+            " SL=", DoubleToString(sl, _Digits),
+            " retcode=", trade.ResultRetcode(),
+            " desc=", trade.ResultRetcodeDescription(),
+            " last_error=", GetLastError());
    }
 }
 
@@ -983,5 +1036,33 @@ string DirStr(int d)
    if(d == -1)
       return "SELL";
    return "NEUTRAL";
+}
+
+//+------------------------------------------------------------------+
+void PrintOpenPositionsDebug()
+{
+   if(!DebugOpenPositions)
+      return;
+
+   datetime now = TimeCurrent();
+   if(now - last_positions_debug_time < 20)
+      return;
+   last_positions_debug_time = now;
+
+   int buy_count = CountOurPositionsByType(1);
+   int sell_count = CountOurPositionsByType(-1);
+   double buy_profit = SideProfit(1);
+   double sell_profit = SideProfit(-1);
+   double buy_avg = SideAverageOpenPrice(1);
+   double sell_avg = SideAverageOpenPrice(-1);
+
+   Print("POSITIONS | BUY count=", buy_count,
+         " avg=", DoubleToString(buy_avg, _Digits),
+         " PnL=", DoubleToString(buy_profit, 2),
+         " avgLevels=", avg_levels_buy,
+         " || SELL count=", sell_count,
+         " avg=", DoubleToString(sell_avg, _Digits),
+         " PnL=", DoubleToString(sell_profit, 2),
+         " avgLevels=", avg_levels_sell);
 }
 //+------------------------------------------------------------------+
