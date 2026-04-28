@@ -40,7 +40,9 @@ input int     MedSignal_Pos         = 2;      // 5-7 points
 input int     StrongSignal_Pos      = 3;      // 8+ points
 
 input group "Execution filters"
-input double  MaxSpread_Pips        = 4.0;
+input double  MaxSpread_Pips        = 0.0;    // 0 = do not block entries by spread
+input double  SpreadAtrReduce_1     = 0.35;   // Spread/ATR above this reduces position count by 1
+input double  SpreadAtrReduce_2     = 0.70;   // Spread/ATR above this reduces position count by 2
 input int     MaxTotalPositions     = 12;
 input int     MaxPositionsPerSide   = 6;
 input int     MinSecondsBetweenEntries = 20;
@@ -155,7 +157,7 @@ void OnTick()
       return;
 
    double spread_pips = (ask - bid) / PipSize;
-   if(spread_pips > MaxSpread_Pips)
+   if(MaxSpread_Pips > 0.0 && spread_pips > MaxSpread_Pips)
    {
       if(DebugMode && IsNewM1Bar())
          Print("Skip: spread ", DoubleToString(spread_pips, 1), " pips");
@@ -375,6 +377,21 @@ SignalData AnalyzeSignal(double &ema20[],
    int by_lot_cap = (int)MathFloor(MaxLotPerSignal / BaseLot);
    positions = MathMax(1, MathMin(positions, by_lot_cap));
    positions = MathMin(positions, MaxPositionsPerSide - same_side_positions);
+
+   double spread_pips = (ask - bid) / PipSize;
+   double spread_atr_ratio = (atr[1] > 0.0) ? ((ask - bid) / atr[1]) : 0.0;
+   int spread_reduction = 0;
+   if(spread_atr_ratio >= SpreadAtrReduce_2)
+      spread_reduction = 2;
+   else if(spread_atr_ratio >= SpreadAtrReduce_1)
+      spread_reduction = 1;
+
+   if(spread_reduction > 0)
+      positions = MathMax(1, positions - spread_reduction);
+
+   sig.reason += "spread=" + DoubleToString(spread_pips, 1) +
+                 "p ATRratio=" + DoubleToString(spread_atr_ratio, 2) + " ";
+
    if(positions <= 0)
    {
       sig.reason += "no side capacity";
