@@ -3,7 +3,7 @@
 //|  Strict M1 scalper for XAUUSD: M1 indicators + tick management   |
 //+------------------------------------------------------------------+
 #property copyright "2026 AndroindDeve + AI"
-#property version   "11.20"
+#property version   "11.30"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -25,7 +25,7 @@ input double  PullbackAtrPart       = 0.25;   // ATR part allowed around EMA/BB 
 input int     MinSecondsBetweenAdds = 45;
 
 input group "Trailing stop"
-input bool    UseTrailing           = true;
+input bool    UseTrailing           = false;  // Disabled: broker rejected frequent SL modifications on GOLD
 input double  TrailStart_Pips       = 10.0;
 input double  TrailStep_Pips        = 5.0;
 
@@ -141,7 +141,7 @@ int OnInit()
    trade.SetDeviationInPoints(30);
    trade.SetAsyncMode(false);
 
-   Print("XAUUSD Scalper M1 Classic v11.20 started. Score-based logic, PERIOD_M1 indicators only.");
+   Print("XAUUSD Scalper M1 Classic v11.30 started. Trailing disabled; score-based PERIOD_M1 logic.");
    return INIT_SUCCEEDED;
 }
 
@@ -588,85 +588,8 @@ void ManagePositions()
 //+------------------------------------------------------------------+
 void ApplyTrailing()
 {
-   if(!UseTrailing)
-      return;
-
-   double trail_start = TrailStart_Pips * PipSize;
-   double trail_step  = TrailStep_Pips  * PipSize;
-   double min_stop_distance = BrokerStopDistance();
-
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(!IsOurPosition(ticket))
-         continue;
-
-      long   ptype  = PositionGetInteger(POSITION_TYPE);
-      double sl_cur = PositionGetDouble(POSITION_SL);
-      double open_p = PositionGetDouble(POSITION_PRICE_OPEN);
-      double tp_cur = PositionGetDouble(POSITION_TP);
-      double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-      if(ptype == POSITION_TYPE_BUY)
-      {
-         double new_sl = NormalizeDouble(bid - MathMax(trail_step, min_stop_distance), _Digits);
-         if(bid - open_p >= trail_start && (sl_cur == 0.0 || new_sl > sl_cur + _Point))
-         {
-            SafeModifyPositionSL(ticket, 1, new_sl, tp_cur, bid, ask);
-         }
-      }
-      else if(ptype == POSITION_TYPE_SELL)
-      {
-         double new_sl = NormalizeDouble(ask + MathMax(trail_step, min_stop_distance), _Digits);
-         if(open_p - ask >= trail_start && (sl_cur == 0.0 || new_sl < sl_cur - _Point))
-         {
-            SafeModifyPositionSL(ticket, -1, new_sl, tp_cur, bid, ask);
-         }
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-double BrokerStopDistance()
-{
-   int stops_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   int freeze_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
-   int min_points = MathMax(stops_level, freeze_level) + 2;
-   return MathMax(min_points * _Point, _Point);
-}
-
-//+------------------------------------------------------------------+
-bool IsStopAllowed(int direction, double sl, double bid, double ask)
-{
-   double min_dist = BrokerStopDistance();
-   if(direction == 1)
-      return (sl > 0.0 && bid - sl >= min_dist);
-   if(direction == -1)
-      return (sl > 0.0 && sl - ask >= min_dist);
-   return false;
-}
-
-//+------------------------------------------------------------------+
-void SafeModifyPositionSL(ulong ticket, int direction, double sl, double tp,
-                          double bid, double ask)
-{
-   if(!IsStopAllowed(direction, sl, bid, ask))
-      return;
-
-   ResetLastError();
-   if(trade.PositionModify(ticket, sl, tp))
-      return;
-
-   if(TimeCurrent() - last_trailing_error_time >= 30)
-   {
-      last_trailing_error_time = TimeCurrent();
-      Print("Trailing modify skipped/failed ticket=", ticket,
-            " SL=", DoubleToString(sl, _Digits),
-            " retcode=", trade.ResultRetcode(),
-            " desc=", trade.ResultRetcodeDescription(),
-            " last_error=", GetLastError());
-   }
+   // Disabled intentionally: GOLD broker stop/freeze levels caused invalid-stops spam.
+   return;
 }
 
 //+------------------------------------------------------------------+
