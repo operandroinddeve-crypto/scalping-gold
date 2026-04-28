@@ -3,7 +3,7 @@
 //|  Strict M1 scalper for XAUUSD: M1 indicators + tick management   |
 //+------------------------------------------------------------------+
 #property copyright "2026 AndroindDeve + AI"
-#property version   "10.00"
+#property version   "10.01"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -40,7 +40,6 @@ input int     MedSignal_Pos         = 2;      // 5-7 points
 input int     StrongSignal_Pos      = 3;      // 8+ points
 
 input group "Execution filters"
-input double  MaxSpread_Pips        = 0.0;    // 0 = do not block entries by spread
 input double  SpreadAtrReduce_1     = 0.35;   // Spread/ATR above this reduces position count by 1
 input double  SpreadAtrReduce_2     = 0.70;   // Spread/ATR above this reduces position count by 2
 input int     MaxTotalPositions     = 12;
@@ -124,7 +123,7 @@ int OnInit()
    trade.SetDeviationInPoints(30);
    trade.SetAsyncMode(false);
 
-   Print("XAUUSD Scalper M1 v10 started. Strict PERIOD_M1 indicators, tick management enabled.");
+   Print("XAUUSD Scalper M1 v10.01 started. Spread never blocks entries; PERIOD_M1 indicators, tick management enabled.");
    return INIT_SUCCEEDED;
 }
 
@@ -155,14 +154,6 @@ void OnTick()
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    if(ask <= 0 || bid <= 0 || ask <= bid)
       return;
-
-   double spread_pips = (ask - bid) / PipSize;
-   if(MaxSpread_Pips > 0.0 && spread_pips > MaxSpread_Pips)
-   {
-      if(DebugMode && IsNewM1Bar())
-         Print("Skip: spread ", DoubleToString(spread_pips, 1), " pips");
-      return;
-   }
 
    if(CountOurPositions() >= MaxTotalPositions)
       return;
