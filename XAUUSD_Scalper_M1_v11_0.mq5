@@ -1,16 +1,17 @@
 //+------------------------------------------------------------------+
 //|              XAUUSD_Scalper_M1_v11_0.mq5                         |
-//|  M1 GOLD scalper v11.0 – Complete overhaul                       |
+//|  M1 GOLD scalper v11.1                                           |
 //|                                                                   |
 //|  Fixed vs v10.x:                                                 |
 //|  [BUG] BlockNewEntryWhenInMarket was declared but never used     |
 //|  [BUG] PositionsForScore thresholds didn't match comments        |
 //|  [BUG] RSI scoring gave bonuses for contradictory zones          |
 //|  [BUG] Duplicate position-open check blocked all scaling         |
+//|  [BUG] MaxSpreadPips=3 blocked all XAUUSD entries (15+ is normal)|
 //|  [RISK] Risk now % of EQUITY with auto-calculated lot size       |
 //|  [RISK] Hard SL + TP in pips set on every order                 |
 //|  [RISK] Trailing stop + breakeven to lock profits                |
-//|  [RISK] Daily drawdown limit – stops trading on hit              |
+//|  [RISK] Daily drawdown limit removed (disabled)                  |
 //|  [SIGNAL] H1 EMA(50) trend filter – no entries against H1 trend |
 //|  [SIGNAL] Fast MACD(3,10,3) replaces lagging MACD(12,26,9)     |
 //|  [SIGNAL] RSI(9) replaces RSI(14) for M1 responsiveness         |
@@ -20,7 +21,7 @@
 //|  [LOGIC] No hedging by default (prevents stuck two-sided grid)  |
 //+------------------------------------------------------------------+
 #property copyright "2026 AndroindDeve + AI"
-#property version   "11.0"
+#property version   "11.1"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -29,11 +30,10 @@ CTrade trade;
 //=== Inputs ==========================================================
 
 input group "Version"
-input string  EA_Version = "v11.0";
+input string  EA_Version = "v11.1";
 
 input group "Risk Management"
 input double  RiskPctPerTrade    = 1.0;   // % of EQUITY risked per position (SL-based)
-input double  MaxDailyLossPct    = 3.0;   // Stop trading if daily equity drawdown >= this %
 input double  MaxTotalRiskPct    = 4.0;   // Block new entries if approx open risk >= this %
 input double  SL_Pips            = 20.0;  // Fixed stop-loss in pips
 input double  TP_Pips            = 30.0;  // Fixed take-profit in pips (1.5 : 1 R:R)
@@ -61,11 +61,12 @@ input bool    RequireDIDirection          = true;
 input bool    AvoidChasingExtremes        = true;
 input double  ExtremeBuffer_Pips          = 1.5;
 input double  MaxChaseBodyAtrPart         = 0.45;
-input double  MaxSpreadPips               = 3.0;   // Skip entry if spread exceeds this
 input double  SpreadAtrReduce_1           = 0.30;  // Spread/ATR ratio: reduce 1 position
 input double  SpreadAtrReduce_2           = 0.55;  // Spread/ATR ratio: reduce 2 positions
 input int     DeviationPoints             = 30;
 input bool    ManageLegacyMagic           = true;
+// XAUUSD spreads are 15-50 pips during normal hours, 0 = disabled
+input double  MaxSpreadPips               = 50.0;  // Skip entry if spread > this (0 = no limit)
 
 input group "Pyramid adds (profitable side only)"
 input bool    UsePyramidAdds        = true;
@@ -130,9 +131,6 @@ datetime last_pyramid_sell_time  = 0;
 datetime last_positions_debug_time = 0;
 int      pyramid_levels_buy  = 0;
 int      pyramid_levels_sell = 0;
-double   day_start_equity = 0.0;
-datetime day_start_time   = 0;
-bool     daily_limit_hit  = false;
 
 struct SignalData
 {
@@ -171,12 +169,9 @@ int OnInit()
    trade.SetDeviationInPoints(DeviationPoints);
    trade.SetAsyncMode(false);
 
-   day_start_equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   day_start_time   = TimeCurrent();
-
    Print("XAUUSD Scalper M1 ", EA_Version, " started.",
          " Risk=", RiskPctPerTrade, "% SL=", SL_Pips, "p TP=", TP_Pips, "p",
-         " H1Filter=", UseH1Filter, " DailyLimitPct=", MaxDailyLossPct, "%");
+         " H1Filter=", UseH1Filter, " MaxSpread=", MaxSpreadPips, "p");
    return INIT_SUCCEEDED;
 }
 
@@ -196,7 +191,6 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   CheckDailyReset();
    ManagePositions();
    PrintOpenPositionsDebug();
 
@@ -205,18 +199,11 @@ void OnTick()
    if(ask <= 0.0 || bid <= 0.0 || ask <= bid)
       return;
 
-   if(UsePyramidAdds && IsTradingSession() && !daily_limit_hit)
+   if(UsePyramidAdds && IsTradingSession())
       CheckSmartPyramidAdds(ask, bid);
 
    if(!IsTradingSession())
       return;
-
-   if(daily_limit_hit)
-   {
-      if(DebugMode)
-         Print("SKIP: daily loss limit hit, no new entries today");
-      return;
-   }
 
    if(SignalOnlyOnNewM1Bar)
    {
@@ -919,8 +906,6 @@ double NormalizeInitialStop(int direction, double sl, double ask, double bid)
 // [UPDATED] CanOpenNewEntry: checks daily limit and total open risk
 bool CanOpenNewEntry()
 {
-   if(daily_limit_hit) return false;
-
    // Approximate open risk guard
    if((double)CountOurPositions() * RiskPctPerTrade >= MaxTotalRiskPct) return false;
 
@@ -942,37 +927,6 @@ bool IsTradingSession()
    MqlDateTime tm;
    TimeToStruct(gmt, tm);
    return (tm.hour >= Session_Start_H && tm.hour < Session_End_H);
-}
-
-//+------------------------------------------------------------------+
-// [NEW] Reset daily tracking at the start of each new trading day
-void CheckDailyReset()
-{
-   MqlDateTime now_struct, day_struct;
-   TimeToStruct(TimeCurrent(), now_struct);
-   TimeToStruct(day_start_time, day_struct);
-
-   if(day_start_time == 0 || now_struct.day != day_struct.day)
-   {
-      day_start_equity = AccountInfoDouble(ACCOUNT_EQUITY);
-      day_start_time   = TimeCurrent();
-      daily_limit_hit  = false;
-      Print("NEW_DAY equity_reset=", DoubleToString(day_start_equity, 2));
-      return;
-   }
-
-   if(!daily_limit_hit && day_start_equity > 0.0)
-   {
-      double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
-      double loss_pct  = (day_start_equity - equity) / day_start_equity * 100.0;
-      if(loss_pct >= MaxDailyLossPct)
-      {
-         daily_limit_hit = true;
-         Print("DAILY_LIMIT_HIT loss=", DoubleToString(loss_pct, 2),
-               "% limit=", DoubleToString(MaxDailyLossPct, 1), "%",
-               " – no new entries until next day");
-      }
-   }
 }
 
 //+------------------------------------------------------------------+
@@ -1159,8 +1113,7 @@ void PrintOpenPositionsDebug()
          " || SELL count=", CountPositionsByDirection(-1),
          " avg=",  DoubleToString(SideAverageOpenPrice(-1), _Digits),
          " PnLpips=", DoubleToString(SideProfitPips(-1), 1),
-         " pyram=", pyramid_levels_sell,
-         " | dailyLimitHit=", daily_limit_hit);
+         " pyram=", pyramid_levels_sell);
 }
 
 //+------------------------------------------------------------------+
