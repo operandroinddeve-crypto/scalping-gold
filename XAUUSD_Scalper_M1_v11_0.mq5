@@ -1,19 +1,18 @@
 //+------------------------------------------------------------------+
 //|              XAUUSD_Scalper_M1_v11_0.mq5                         |
-//|  M1 GOLD scalper v11.2                                           |
+//|  M1 GOLD scalper v11.3                                           |
 //|                                                                   |
-//|  Fixed vs v11.1:                                                 |
-//|  [BUG] SL_Pips=20 was smaller than the spread (23p), causing    |
-//|         immediate stop-out on every trade                         |
-//|  [BUG] Fixed-pip SL/TP ignored XAUUSD volatility (ATR 150-300p) |
-//|  [FIX] SL/TP now ATR-based (SL=1.5*ATR, TP=2.0*ATR) and        |
-//|         self-adjust to current market conditions                  |
-//|  [FIX] Minimum SL enforced at spread*2 to avoid instant stops   |
-//|  [FIX] Lot size now calculated from ATR-based SL distance        |
-//|  [FIX] Breakeven and trailing thresholds use ATR fractions        |
+//|  Fixed vs v11.2:                                                 |
+//|  [BUG] UseH1Filter=true blocked every entry (H1 rarely aligned  |
+//|         with M1 scalp direction) – now false by default          |
+//|  [BUG] Auto lot-sizing produced 0.23 lot instead of 0.01        |
+//|  [FIX] Fixed BaseLot=0.01 – no auto-sizing, user controls size  |
+//|  [FIX] MaxTotalPositions=15, MaxPositionsPerSide=10 for scaling  |
+//|  [FIX] BlockNewEntryWhenInMarket=false – scales into moves       |
+//|  [FIX] Pyramid adds use same BaseLot (not half)                  |
 //+------------------------------------------------------------------+
 #property copyright "2026 AndroindDeve + AI"
-#property version   "11.2"
+#property version   "11.3"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -22,20 +21,18 @@ CTrade trade;
 //=== Inputs ==========================================================
 
 input group "Version"
-input string  EA_Version = "v11.2";
+input string  EA_Version = "v11.3";
 
 input group "Risk Management"
-input double  RiskPctPerTrade    = 1.0;   // % of EQUITY risked per position (SL-based)
-input double  MaxTotalRiskPct    = 4.0;   // Block new entries if approx open risk >= this %
-// SL/TP are ATR-based: distance = ATR(14) * multiplier
-// For XAUUSD M1: ATR is typically 150-300 pips, so SL ~200-450p, TP ~270-600p
-input double  SL_ATR_Mult        = 1.5;   // SL distance = ATR * this (min: spread*2)
-input double  TP_ATR_Mult        = 2.0;   // TP distance = ATR * this → R:R = 1.33:1
-input double  MinSL_Pips         = 50.0;  // Absolute minimum SL in pips (safety floor)
-// Breakeven and trailing also use ATR fractions
+input double  BaseLot            = 0.01;  // Fixed lot size per position (no auto-sizing)
+// SL/TP are ATR-based – auto-adapt to XAUUSD volatility (ATR M1 ~150-300 pips)
+input double  SL_ATR_Mult        = 1.5;   // SL = ATR * this (floor = MinSL_Pips and spread*2)
+input double  TP_ATR_Mult        = 2.0;   // TP = ATR * this  → R:R = 1.33:1
+input double  MinSL_Pips         = 50.0;  // Absolute minimum SL (pips)
+// Breakeven and trailing use ATR fractions
 input double  BreakevenAt_ATR    = 0.6;   // Move SL to breakeven when profit >= ATR*this
-input double  TrailActivate_ATR  = 0.9;   // Activate trailing stop when profit >= ATR*this
-input double  TrailStep_ATR      = 0.4;   // Trail distance = ATR * this
+input double  TrailActivate_ATR  = 0.9;   // Activate trailing when profit >= ATR*this
+input double  TrailStep_ATR      = 0.4;   // Trailing distance = ATR * this
 
 input group "Signal sizing"
 input int     WeakSignal_Positions   = 1; // score  8-9  → 1 position
@@ -44,10 +41,10 @@ input int     StrongSignal_Positions = 3; // score  12   → 3 positions
 input int     MinEntryScore          = 8;
 
 input group "Execution filters"
-input int     MaxTotalPositions           = 4;
-input int     MaxPositionsPerSide         = 2;
-input int     MinSecondsBetweenEntries    = 60;
-input bool    BlockNewEntryWhenInMarket   = false; // true = only 1 entry at a time, wait for close
+input int     MaxTotalPositions           = 15;   // Allow up to 15 open positions
+input int     MaxPositionsPerSide         = 10;   // Up to 10 per direction
+input int     MinSecondsBetweenEntries    = 30;   // Faster re-entry on M1
+input bool    BlockNewEntryWhenInMarket   = false; // false = scale into moves
 input bool    OneEntryPerM1Bar            = true;
 input bool    SignalOnlyOnNewM1Bar        = true;
 input bool    AllowHedging                = false; // false = no simultaneous BUY+SELL positions
@@ -98,8 +95,8 @@ input int     MicroRange_Bars     = 5;
 input double  MinMicroRange_Pips  = 2.0;
 
 input group "H1 Trend Filter"
-input bool    UseH1Filter    = true;  // Require H1 EMA alignment before new entries
-input int     H1_EMA_Period  = 50;    // H1 EMA period (higher = smoother trend bias)
+input bool    UseH1Filter    = false; // false = pure M1 scalping; true = require H1 EMA align
+input int     H1_EMA_Period  = 50;    // H1 EMA period used when UseH1Filter=true
 
 input group "Debug"
 input bool    DebugMode                  = true;
@@ -166,9 +163,10 @@ int OnInit()
    trade.SetAsyncMode(false);
 
    Print("XAUUSD Scalper M1 ", EA_Version, " started.",
-         " Risk=", RiskPctPerTrade,
-         "% SL=", SL_ATR_Mult, "xATR TP=", TP_ATR_Mult, "xATR",
+         " Lot=", BaseLot,
+         " SL=", SL_ATR_Mult, "xATR TP=", TP_ATR_Mult, "xATR",
          " MinSL=", MinSL_Pips, "p",
+         " MaxPos=", MaxTotalPositions, "/", MaxPositionsPerSide,
          " H1Filter=", UseH1Filter,
          " MaxSpread=", MaxSpreadPips, "p");
    return INIT_SUCCEEDED;
@@ -649,8 +647,7 @@ void TryPyramidAdd(int direction, double ask, double bid)
    if(!IsPyramidZone(direction, ask, bid))
       return;
 
-   double lot = CalcLot() * 0.5; // Half-size lot for pyramid adds
-   lot = NormLot(lot);
+   double lot = CalcLot(); // Same BaseLot for pyramid adds
 
    double sl = CalcSL(direction, ask, bid);
    double tp = CalcTP(direction, ask, bid);
@@ -882,29 +879,10 @@ double CalcTP(int direction, double ask, double bid)
 }
 
 //+------------------------------------------------------------------+
-// [FIX] CalcLot: lot sized from equity risk % and actual ATR-based SL
+// CalcLot: returns fixed BaseLot (user-controlled, no auto-sizing)
 double CalcLot()
 {
-   double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
-   double risk_money = equity * RiskPctPerTrade / 100.0;
-
-   double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tick_size  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-   double sl_dist_price = CalcSLDist(ask, bid); // price units
-   if(sl_dist_price <= 0.0 || tick_value <= 0.0 || tick_size <= 0.0)
-      return NormLot(0.01);
-
-   // P&L per lot per 1 price unit = tick_value / tick_size
-   double val_per_price_unit = tick_value / tick_size;
-   if(val_per_price_unit <= 0.0)
-      return NormLot(0.01);
-
-   double lot = risk_money / (sl_dist_price * val_per_price_unit);
-   return NormLot(lot);
+   return NormLot(BaseLot);
 }
 
 //+------------------------------------------------------------------+
